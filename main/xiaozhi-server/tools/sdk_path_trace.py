@@ -236,6 +236,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=("embed", "llm"), required=True)
     parser.add_argument("--model", default="")
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--dimensions", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=0)
     args = parser.parse_args()
     report = {"credentials_printed": False, "proxy": proxy_report()}
@@ -246,8 +247,8 @@ def main() -> int:
             json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
             sys.stdout.write("\n")
             return 2
-        dims = os.environ.get("MEM0_EMBEDDING_DIMS")
-        report.update(embed_samples(model, int(dims) if dims else None, args.repeats or 3))
+        dims = args.dimensions or (int(os.environ["MEM0_EMBEDDING_DIMS"]) if os.environ.get("MEM0_EMBEDDING_DIMS") else None)
+        report.update(embed_samples(model, dims, args.repeats or 3))
     else:
         if args.config:
             api_key, base_url, model = llm_settings_from_config(args.config)
