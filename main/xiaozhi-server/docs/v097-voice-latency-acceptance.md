@@ -1,55 +1,50 @@
-# v0.9.7 语音时延、遗忘记忆、启动与任务投递
+# v0.9.7 最小叠层：计时、记忆失败、确认式遗忘
 
-这个补丁的父提交是标签 `v0.9.7`，完整哈希 `87c6df77b0220ddbd8fc804f984f83f69f3225e5`。不要把它合并进当前 `main`。`main` 已经继续到后续版本，直接合并等于把服务器从 v0.9.7 抬上去。
+父提交是标签 `v0.9.7`，哈希 `87c6df77b0220ddbd8fc804f984f83f69f3225e5`。不要把这个分支合并进 `main`。
 
-现场服务器是 Python 3.10.18 上的 xiaozhi-server v0.9.7，精确 git 提交未知。选型和人设留在本机 `data/.config.yaml` 与 `config.yaml` 的提示词里：SileroVAD、FunASR、AliLLM `qwen-flash`、EdgeTTS、`mem0_selfhost`（`:8888`）、`function_call`、人格 Taky。本补丁不改这些选型，也不改提示词。
+这个补丁不改 `config.yaml`，也不包含 `data/.config.yaml`。人设、音色和本机覆盖配置保持原文件。`agent_id` 默认仍是 `rocky`。
 
-## 仓库里没有的现场代码
+## 现场文件怎么叠
 
-对照 `v0.9.7` 和这个 fork 的 `main`，都没有：
+已对照过的现场文件：
 
-- `mem0_selfhost` 记忆模块
-- 现场那份已经启用、但没做过端到端测试的 `plugins_func/functions/forget_memory.py`
+- `core/handle/receiveAudioHandle.py`：保留 FunASR `content` 解析。记忆查询不提前创建任务。
+- `core/providers/tts/base.py`：保留引号安全切句。两处被误打码的调用恢复为 v0.9.7 的 `textUtils.get_string_no_punctuation_or_emoji`。
+- `core/providers/tts/edge.py`：与 v0.9.7 相同，只多记提供者首个音频字节。
+- `core/providers/memory/mem0_selfhost/mem0_selfhost.py`：按现场的自建接口改写，不再把响应正文写进日志。
+- `plugins_func/functions/forget_memory.py`：按现场的搜索加删除流程收紧。本机若已有同名文件，部署前先对照备份，不要和别的插件一起覆盖。
 
-因此这里没有假装写出和现场私有模块兼容的 HTTP 客户端。`MemoryProviderBase` 默认的 `list_own_memories` / `delete_own_memories` 返回不支持，并且一条都不删。云端 `mem0ai` 只在记录里带有相同 `user_id` 时按编号删除，不会调用 `delete_all`。
+已核对与 v0.9.7 一致、因此只加计时的文件：`connection.py`、`sendAudioHandle.py`、`listenMessageHandler.py`、`asr/base.py`、`vad/silero.py`。没有改 `memory/base.py`、`mem0ai.py`、`plugins_func/register.py`。
 
-如果本机已经有 `forget_memory.py` 或 `core/providers/memory/mem0_selfhost/`，先别覆盖。把去掉密钥、用户编号和记忆正文后的文件交回来，才能判断它和这份确认式删除是否是同一个接口。
+上传的 `edge.py` 相对 v0.9.7 只有文件末尾换行，没有单独的放大链路。`base.py` 相对 v0.9.7 的实质差别是引号安全切句。
 
-## 时延
+## 计时
 
-每轮用 `time.monotonic()` 记这些点：`end_of_speech`、`asr_final`、`memory_lookup_start`、`memory_lookup_end`、`llm_request`、`llm_first_token`、`llm_first_sentence`、`tts_request`、`tts_first_audio`、`playback_first_audio`。日志只有编号、毫秒和计数。查询原文、记忆正文和密钥不会进这些行。
+阶段：`end_of_speech`、`asr_final`、`memory_lookup_start`、`memory_lookup_end`、`llm_request`、`llm_first_token`、`llm_first_sentence`、`tts_request`、`tts_first_audio`、`server_audio_sent`。
 
-已观察到的 4 到 5 秒是 ASR 文本出现之后的 Mem0 `/search`。补丁把同一次查询提前到意图判断和字幕发送之前，模型请求仍然等这次查询结束。这只盖住查询开始前的那一小段准备时间，不能把 4 到 5 秒的搜索本身变短。若现场模块在事件循环里做同步 HTTP，这段重叠也不会发生。
+`tts_first_audio` 是 TTS 提供者产出的第一段音频。`server_audio_sent` 是服务器把第一包交给套接字。两者都不是设备喇叭已经播出。摘要里的 `hardware_playback=unmeasured` 表示没有设备播放时刻。
 
-查询超时默认 15 秒，高于已看到的 1 到 5 秒成功查询。超时、异常或返回值不是字符串时，不把空记忆交给模型，并说出固定的“为避免记错，这句话我先不回答”。提供者返回的空字符串仍表示“没有匹配记忆”，和 v0.9.7 的 `mem0ai` 一样。要恢复一直等待，在 `data/.config.yaml` 写 `memory_query_timeout_seconds: 0`。
+记忆搜索花了多久，这些日志就记多久。搜索本身没有变短，不能据此说语音变快了。
 
-11 到 12 秒被拆开记录，不把它当成已经测到的物理加速。`tts_first_segment_max_chars` 默认 0，切句和原来一样。只有后续日志显示“首 token 到第一句”很长时，才在 `data/.config.yaml` 试一个正数，例如 20，并再看同一条计时。设回 0 即恢复。
+## 记忆失败
 
-识别文本的旧信息日志仍然会打出文本。新的计时行不会。
+查询仍在 `chat()` 里才开始，和 v0.9.7 一样从工作线程交给事件循环。识别结束时不创建任务。提供者如果在协程里同步阻塞，超时取消不了这次调用；工作线程到达 `memory_query_timeout_seconds`（代码默认 15，可在本机 `data/.config.yaml` 覆盖，本补丁不写这个文件）后会丢弃晚到的结果。
+
+HTTP 非 200、传输失败、返回值不是字符串：不把空字符串交给模型，并说明这次不回答，以免把故障说成没有记忆。HTTP 200 且没有条目仍然是空记忆，模型会照常回答。
+
+自建客户端按事件循环复用一个 `httpx.AsyncClient`。保存记忆若跑在另一个事件循环里，会用那个循环自己的客户端，不会把客户端跨循环共用。
 
 ## 遗忘
 
-工具名 `forget_memory`。默认不加入 `function_call.functions`。启用前在 `data/.config.yaml` 的函数列表里加上它。
+预览只搜索 `user_id` 为当前 `role_id` 的候选。删除必须同时满足：编号来自这次预览、口令一致、`GET /memories/{id}` 返回的 `user_id` 相同。不满足就没有 `DELETE`。日志不包含记忆正文。
 
-流程是 preview，再让用户原样复述口令，然后 confirm。confirm 必须带上 preview 的同一组编号。只删除当前 `role_id`（设备编号）名下、且后端再次核对过所有者的编号。超过 5 条、空查询、过期、口令不对、身份变化都不会删。没有“清空全部”或重置。
+如果自建服务没有 `GET /memories/{id}`，删除会全部拒绝。这是未关闭的验收项，不能当成已经能在现场忘掉一条记忆。
 
-## 启动
+## 还不能算验收通过
 
-`scripts/mac/preflight_xiaozhi.sh` 和 `scripts/mac/start_xiaozhi.sh` 只使用调用者给出的目录和 Python。它们拒绝 root，发现目录不可读就退出，不改系统隐私设置，也不搬文件。Mem0 用有限次数的 TCP 检查；如果另外给了健康检查地址，502 和 503 视为没就绪。端口已被占用时不杀进程。启动脚本只在进程马上退出时重试，最多 5 次，然后停。这不是开机自启已经测过的结论。
-
-`com.xiaozhi.server.plist.template` 的 `RunAtLoad` 和 `KeepAlive` 都是 false。不要把路径指到桌面：launchd 读桌面会被系统拒绝。固件里的 `192.168.31.73` 不由这些脚本改写。只有设置 `XIAOZHI_HOSTNAME_CHECK=1` 时才做一次本机解析测试。
-
-## Grok 任务
-
-工具名 `submit_grok_task`，默认不加载，配置仍是占位符。普通对话不会走它。用户明确要把一件事交给「Taky 的灵魂」时，模型先 preview，用户复述口令后才 confirm。请求体只有 `task_id`、`text`、`time`。密钥放在本机配置或 `GROK_TASK_WEBHOOK_SECRET`，占位符不会发出请求。最多 3 次、单次最多 10 秒。HTTP 200 只表示接受，不表示做完。超时或 5xx 之后再得到 200，会说结果不确定，因为没有假定对方会去重。结果先留在机器人对话里，这里没有回调。测试使用假的 webhook，不会访问真实地址。
-
-## 安装
-
-1. 在 Mac 上备份将要替换的文件。不要覆盖 `data/.config.yaml`，不要改 `selected_module`。
-2. 确认服务器树和 `v0.9.7` 的这些路径一致，再套用补丁。若 `forget_memory.py` 或 `mem0_selfhost` 已存在，先停下来做 diff。
-3. 在服务器目录执行测试：`python -m pytest tests/test_utterance_timing.py tests/test_memory_gate.py tests/test_tts_segment.py tests/test_forget_memory.py tests/test_submit_grok_task.py tests/test_mem0_record_scope.py tests/test_mac_preflight.py tests/test_v097_config_guard.py`
-4. 前台跑 `scripts/mac/preflight_xiaozhi.sh`，再跑 `scripts/mac/start_xiaozhi.sh`。看日志里的 `utterance` 行，不要根据这一步宣布物理播报已经变快。
-
-回退：用备份盖回被替换的文件，并删掉本补丁新增的文件。`data/.config.yaml` 若没有被修改，就不用动。
-
-云端测试跑在 Python 3.12 上，用的是假记忆、假 webhook 和本地端口。没有在 Mac 上部署，也没有做真实语音验收。
+- 没有在 Mac 上部署，也没有做现场语音或串口验收。
+- 没有访问 `:8888`。所有 HTTP 测试都是假传输。
+- 云端 Python 是 3.10.18 的单元测试，不是现场进程。
+- 旧的 TTS 成功日志仍可能带句子文本；新计时行不带。
+- 任务投递不在这个补丁里。
+- 现场 `config.yaml` 的 Taky 提示词没有收到，也没有改。

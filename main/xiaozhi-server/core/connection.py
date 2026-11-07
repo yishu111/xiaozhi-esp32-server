@@ -45,7 +45,7 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
-from core.utils.llm_stream import iter_until_abort
+from core.utils.llm_stream import consume_until_abort
 from core.utils.memory_gate import (
     MEMORY_TIMEOUT_SPOKEN,
     resolve_memory_blocking,
@@ -1165,7 +1165,7 @@ class ConnectionHandler:
         content_arguments = ""
         emotion_flag = True
         try:
-            for response in iter_until_abort(llm_responses, lambda: self.client_abort):
+            for response in consume_until_abort(llm_responses, lambda: self.client_abort):
                 if self.intent_type == "function_call" and functions is not None:
                     content, tools_call = response
                     if "content" in response:
@@ -1231,7 +1231,7 @@ class ConnectionHandler:
                             )
                         )
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
+            self.logger.bind(tag=TAG).error(f"LLM stream processing error: {type(e).__name__}")
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,

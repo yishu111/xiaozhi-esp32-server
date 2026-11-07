@@ -282,7 +282,7 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         mark_sentence(
             conn,
             flow_control.get("sentence_id"),
-            "playback_first_audio",
+            "server_audio_sent",
             bytes=len(opus_packet),
         )
 

@@ -172,7 +172,7 @@ class ASRProviderBase(ABC):
                 from core.utils.utterance_timing import finish_timing, note_asr_final
 
                 note_asr_final(conn, 0)
-                finish_timing(conn, complete=False)
+                finish_timing(conn, server_sent=False)
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback

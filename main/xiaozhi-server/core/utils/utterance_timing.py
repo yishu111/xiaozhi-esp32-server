@@ -6,6 +6,7 @@ so recognized text, memory bodies, and secrets cannot land in the log.
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from typing import Any, Callable, Optional
@@ -22,7 +23,7 @@ STAGES = (
     "llm_first_sentence",
     "tts_request",
     "tts_first_audio",
-    "playback_first_audio",
+    "server_audio_sent",
 )
 
 _ENUMS = {
@@ -39,7 +40,7 @@ _SUMMARY_GAPS = (
     ("first_token_to_sentence_ms", "llm_first_token", "llm_first_sentence"),
     ("sentence_to_tts_ms", "llm_first_sentence", "tts_request"),
     ("tts_to_first_audio_ms", "tts_request", "tts_first_audio"),
-    ("audio_to_playback_ms", "tts_first_audio", "playback_first_audio"),
+    ("tts_audio_to_server_send_ms", "tts_first_audio", "server_audio_sent"),
 )
 
 
@@ -52,12 +53,11 @@ class UtteranceTiming:
         self.lines: list[str] = []
         self.aborted = False
         self.finished = False
-        self.complete = False
+        self.server_sent = False
+        self._lock = threading.Lock()
 
     def mark(self, stage: str, **meta: Any) -> bool:
         if stage not in STAGES:
-            return False
-        if stage in self.marks:
             return False
         clean: dict[str, Any] = {}
         redacted = False
@@ -74,19 +74,24 @@ class UtteranceTiming:
                 redacted = True
         if redacted:
             clean["redacted"] = 1
-        self.marks[stage] = (self._now(), clean)
+        with self._lock:
+            if stage in self.marks:
+                return False
+            self.marks[stage] = (self._now(), clean)
         return True
 
     def delta_ms(self, earlier: str, later: str) -> Optional[int]:
-        if earlier not in self.marks or later not in self.marks:
-            return None
-        return int(round((self.marks[later][0] - self.marks[earlier][0]) * 1000))
+        with self._lock:
+            if earlier not in self.marks or later not in self.marks:
+                return None
+            return int(round((self.marks[later][0] - self.marks[earlier][0]) * 1000))
 
     def format_stage(self, stage: str) -> str:
-        stamp, meta = self.marks[stage]
+        with self._lock:
+            stamp, meta = self.marks[stage]
+            previous = [item[0] for name, item in self.marks.items() if name != stage]
         t_ms = int(round((stamp - self.t0) * 1000))
-        prev = [item[0] for name, item in self.marks.items() if name != stage]
-        since_prev = int(round((stamp - max(prev)) * 1000)) if prev else t_ms
+        since_prev = int(round((stamp - max(previous)) * 1000)) if previous else t_ms
         if since_prev < 0:
             since_prev = 0
         parts = [
@@ -106,7 +111,8 @@ class UtteranceTiming:
             delta = self.delta_ms(earlier, later)
             parts.append(f"{name}={'na' if delta is None else delta}")
         parts.append(f"aborted={int(self.aborted)}")
-        parts.append(f"complete={int(self.complete)}")
+        parts.append(f"server_sent={int(self.server_sent)}")
+        parts.append("hardware_playback=unmeasured")
         return " ".join(parts)
 
 
@@ -201,20 +207,22 @@ def mark_sentence(conn, sentence_id: Optional[str], stage: str, **meta: Any) -> 
     if not utt.mark(stage, **meta):
         return
     _emit(conn, utt, utt.format_stage(stage))
-    if stage == "playback_first_audio":
-        finish_timing(conn, sentence_id=sentence_id, complete=True)
+    if stage == "server_audio_sent":
+        finish_timing(conn, sentence_id=sentence_id, server_sent=True)
 
 
 def mark_current(conn, stage: str, **meta: Any) -> None:
     mark_sentence(conn, getattr(conn, "sentence_id", None), stage, **meta)
 
 
-def finish_timing(conn, sentence_id: Optional[str] = None, aborted: bool = False, complete: bool = False) -> None:
+def finish_timing(conn, sentence_id: Optional[str] = None, aborted: bool = False, server_sent: bool = False) -> None:
     utt = timing_for_sentence(conn, sentence_id)
     if utt is None or utt.finished:
         return
     if aborted:
         utt.aborted = True
-    utt.complete = bool(complete and "playback_first_audio" in utt.marks)
+    # server_sent means the first packet was handed to the socket, not that
+    # the device speaker has played it.
+    utt.server_sent = bool(server_sent and "server_audio_sent" in utt.marks)
     utt.finished = True
     _emit(conn, utt, utt.format_summary())

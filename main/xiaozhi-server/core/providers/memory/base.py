@@ -26,12 +26,3 @@ class MemoryProviderBase(ABC):
     def init_memory(self, role_id, llm, **kwargs):
         self.role_id = role_id
         self.llm = llm
-
-    async def list_own_memories(self, query: str = "") -> dict:
-        """Default: this backend cannot list deletable records."""
-        return {"supported": False, "records": []}
-
-    async def delete_own_memories(self, memory_ids) -> dict:
-        """Default: delete nothing. Subclasses must opt in per id."""
-        refused = [str(item) for item in (memory_ids or [])]
-        return {"supported": False, "deleted": [], "refused": refused}

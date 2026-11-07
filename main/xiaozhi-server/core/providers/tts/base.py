@@ -6,12 +6,11 @@ import queue
 import asyncio
 import threading
 import traceback
-import concurrent.futures
 
 from core.utils import p3
 from datetime import datetime
 from core.utils import textUtils
-from typing import Callable, Any
+from typing import Callable, Any, Optional
 from abc import ABC, abstractmethod
 from config.logger import setup_logging
 from core.utils import opus_encoder_utils
@@ -20,7 +19,6 @@ from core.utils.output_counter import add_device_output
 from core.handle.reportHandle import enqueue_tts_report
 from core.handle.sendAudioHandle import sendAudioMessage
 from core.utils.util import audio_bytes_to_data_stream, audio_to_data_stream
-from core.utils.tts_segment import cut_first_segment
 from core.utils.utterance_timing import mark_sentence
 from core.providers.tts.dto.dto import (
     TTSMessageDTO,
@@ -120,14 +118,6 @@ class TTSProviderBase(ABC):
 
     def handle_opus(self, opus_data: bytes):
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
-        conn = getattr(self, "conn", None)
-        if conn is not None and opus_data:
-            mark_sentence(
-                conn,
-                getattr(self, "current_sentence_id", None),
-                "tts_first_audio",
-                bytes=len(opus_data),
-            )
         self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, getattr(self, 'current_sentence_id', None)))
 
     def handle_audio_file(self, file_audio: bytes, text):
@@ -151,14 +141,9 @@ class TTSProviderBase(ABC):
                 try:
                     audio_bytes = asyncio.run(self.text_to_speak(text, None))
                     if audio_bytes:
-                        # 流式 TTS 可能已经在首包记过 tts_first_audio，这里重复标记会被忽略。
                         if conn is not None:
-                            mark_sentence(
-                                conn,
-                                sentence_id,
-                                "tts_first_audio",
-                                bytes=len(audio_bytes),
-                            )
+                            # 提供者整段音频已齐。流式首包若已记过 tts_first_audio，这里不会覆盖。
+                            mark_sentence(conn, sentence_id, "tts_first_audio", bytes=len(audio_bytes))
                         # 使用原始文本用于显示/上报
                         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
                         audio_bytes_to_data_stream(
@@ -505,36 +490,103 @@ class TTSProviderBase(ABC):
         if hasattr(self, "ws") and self.ws:
             await self.ws.close()
 
-    def _first_segment_max_chars(self) -> int:
-        conn = getattr(self, "conn", None)
-        config = getattr(conn, "config", None) if conn is not None else None
-        if not isinstance(config, dict):
-            return 0
-        try:
-            return int(config.get("tts_first_segment_max_chars", 0) or 0)
-        except (TypeError, ValueError):
-            return 0
+    # 右引号/右括号，以及它们对应的左侧符号
+    _QUOTE_PAIRS = (
+        ("「", "」"),
+        ("『", "』"),
+        ("“", "”"),
+        ('"', '"'),
+        ("（", "）"),
+        ("《", "》"),
+        ("«", "»"),
+        ("„", "“"),
+        ("【", "】"),
+        ("〈", "〉"),
+        ("［", "］"),
+        ("[", "]"),
+    )
+    # 注意：“（U+201C）有双重语义：中文里是开引号（对应 ”），
+    # 德语 „…“ 里是闭引号；二者冲突时计数法无法兼顾，
+    # 德语句子的切分只能靠“不平衡就顺延”保守处理（最终由 flush 兜底）。
+    _CLOSERS = '」』”》）"»“】〉］]'
+    _QUOTE_CHARS = "".join(ch for pair in _QUOTE_PAIRS for ch in pair)
 
-    def _get_segment_text(self):
+    @classmethod
+    def _quote_safe_cut(cls, text: str, pos: int, punctuations) -> int:
+        """避免在引号内切分（如 「わぁ！」って / “好！”他说）。
+
+        候选位置之后紧跟的右引号和句末标点一并带走；若候选位于未闭合的引号内，
+        或右引号后句子还在继续，则顺延到下一个标点；都不安全时返回 -1，等待更多文本。
+        """
+        if not any(ch in cls._QUOTE_CHARS for ch in text):
+            # 全文不含引号/括号：不存在未闭合引号，右引号也无需携带，候选位置必然安全
+            return pos
+        candidates = [pos] + [
+            i for i, ch in enumerate(text) if i > pos and ch in punctuations
+        ]
+        for candidate in candidates:
+            end = candidate + 1
+            carried_closer = False
+            while end < len(text) and (
+                text[end] in cls._CLOSERS or text[end] in punctuations
+            ):
+                if text[end] in cls._CLOSERS:
+                    carried_closer = True
+                end += 1
+            segment = text[:end]
+            # 前后配对的引号（「」等）用计数差检测；前后同符的引号（"）用奇偶检测
+            balanced = True
+            for opener, closer in cls._QUOTE_PAIRS:
+                n_open = segment.count(opener)
+                if opener == closer:
+                    if n_open % 2:
+                        balanced = False
+                        break
+                elif n_open > segment.count(closer):
+                    balanced = False
+                    break
+            if not balanced:
+                continue
+            if carried_closer and (end == len(text) or not text[end].isspace()):
+                # 右引号之后句子还在继续（「…」って、“…”他说），或暂时看不到后文
+                continue
+            return end - 1
+        return -1
+
+    def _get_segment_text(self) -> Optional[str]:
         # 合并当前全部文本并处理未分割部分
         full_text = "".join(self.tts_text_buff)
         current_text = full_text[self.processed_chars :]  # 从未处理的位置开始
-        segment_text_raw, _kind = cut_first_segment(
-            current_text,
-            is_first=self.is_first_sentence,
-            punctuations=self.punctuations,
-            first_punctuations=self.first_sentence_punctuations,
-            max_chars=self._first_segment_max_chars() if self.is_first_sentence else 0,
+        last_punct_pos = -1
+
+        # 根据是否是第一句话选择不同的标点符号集合
+        punctuations_to_use = (
+            self.first_sentence_punctuations
+            if self.is_first_sentence
+            else self.punctuations
         )
 
-        if segment_text_raw:
-            was_first = self.is_first_sentence
+        # 取每种标点最后出现位置的最早者作为切分点（与逐个 rfind 再取最小值等价）
+        last_seen = {}
+        for i, ch in enumerate(current_text):
+            if ch in punctuations_to_use:
+                last_seen[ch] = i
+        last_punct_pos = min(last_seen.values(), default=-1)
+
+        cut_pos = -1
+        if last_punct_pos != -1:
+            cut_pos = self._quote_safe_cut(
+                current_text, last_punct_pos, punctuations_to_use
+            )
+        if cut_pos != -1:
+            segment_text_raw = current_text[: cut_pos + 1]
             segment_text = textUtils.get_string_no_punctuation_or_emoji(
                 segment_text_raw
             )
             self.processed_chars += len(segment_text_raw)  # 更新已处理字符位置
 
             # 如果是第一句话，在找到第一个逗号后，将标志设置为False
+            was_first = self.is_first_sentence
             if self.is_first_sentence:
                 self.is_first_sentence = False
             if was_first and getattr(self, "conn", None) is not None:

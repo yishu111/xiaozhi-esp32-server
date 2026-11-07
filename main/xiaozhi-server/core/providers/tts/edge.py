@@ -76,6 +76,7 @@ class TTSProvider(TTSProviderBase):
             raise Exception(error_msg)  # 抛出异常，让调用方捕获
 
     def _mark_first_tts_audio(self, audio_chunk: bytes) -> None:
+        """Provider audio byte. Not the first packet written to the device socket."""
         conn = getattr(self, "conn", None)
         if conn is None or not audio_chunk:
             return
