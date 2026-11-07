@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Time one reused SDK client on the process's normal proxy path.
+"""Trace the SDK client Mem0 or the voice LLM actually constructs.
 
-Does not construct Memory, install a patch, or change environment variables.
-The trace callback stores event names and clocks only. It does not keep the
-info dict, so hosts, headers, and bodies from httpcore are not recorded.
+The OpenAI constructor builds its own httpx wrapper, timeout, limits, and
+retry count. This script does not pass another client or another timeout.
+It only replaces ``send`` so each attempt appends trace names. The info dict
+from httpcore is discarded. A sample is summarized after the SDK call returns,
+after the first streamed text token, or after an exception.
 """
 
 from __future__ import annotations
@@ -26,32 +28,47 @@ PHASES = (
 )
 
 
-def proxy_report() -> dict:
-    present = []
-    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
-        if os.environ.get(name):
-            present.append(name)
-    if any(name.lower().startswith("https_") for name in present):
-        source = "env_https"
-    elif any(name.lower().startswith("all_") for name in present):
-        source = "env_all"
-    elif present:
-        source = "env_http"
-    else:
-        source = "none"
-    return {"proxy_enabled": bool(present), "proxy_source": source, "trust_env": True}
+class TraceLog:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, float]] = []
+
+    def add(self, name: str) -> None:
+        self.events.append((name, time.perf_counter()))
+
+    def clear(self) -> None:
+        self.events.clear()
+
+    def summarize(self) -> dict:
+        return summarize_events(self.events)
 
 
-def hostname_of(base_url: str) -> str | None:
-    return urllib.parse.urlsplit(base_url).hostname
+def attach_trace(http_client) -> TraceLog:
+    """Record every send on this client without replacing its transport."""
+    log = TraceLog()
+    original = http_client.send
+
+    def send(request, *args, **kwargs):
+        def trace(name, info):
+            del info
+            log.add(name)
+
+        request.extensions["trace"] = trace
+        return original(request, *args, **kwargs)
+
+    http_client.send = send
+    return log
 
 
 def summarize_events(events: list[tuple[str, float]]) -> dict:
     pending: dict[str, list[float]] = {}
     durations: dict[str, list[float]] = {}
+    started: dict[str, int] = {}
     for name, stamp in events:
         if name.endswith(".started"):
-            pending.setdefault(name[: -len(".started")], []).append(stamp)
+            key = name[: -len(".started")]
+            pending.setdefault(key, []).append(stamp)
+            phase = key.rsplit(".", 1)[-1]
+            started[phase] = started.get(phase, 0) + 1
             continue
         if name.endswith(".complete") or name.endswith(".failed"):
             key = name.rsplit(".", 1)[0]
@@ -60,16 +77,28 @@ def summarize_events(events: list[tuple[str, float]]) -> dict:
                 continue
             phase = key.rsplit(".", 1)[-1]
             durations.setdefault(phase, []).append(round((stamp - starts.pop(0)) * 1000.0, 1))
-    report = {f"{phase}_ms": durations.get(phase, []) for phase in PHASES}
-    report["http_attempts"] = len(report["send_request_headers_ms"])
-    report["connection_reused"] = not report["connect_tcp_ms"] and not report["start_tls_ms"]
+    incomplete = sorted(key.rsplit(".", 1)[-1] for key, starts in pending.items() if starts)
+    report: dict = {"incomplete_phases": incomplete}
+    for phase in PHASES:
+        if phase in incomplete:
+            report[f"{phase}_ms"] = None
+        else:
+            report[f"{phase}_ms"] = durations.get(phase, [])
+    report["http_attempts"] = started.get("send_request_headers", 0)
+    report["connection_reused"] = (
+        "connect_tcp" not in incomplete
+        and "start_tls" not in incomplete
+        and not report["connect_tcp_ms"]
+        and not report["start_tls_ms"]
+    )
     return report
 
 
 def classify(samples: list[dict]) -> str:
-    """Map traced calls to the next action. Thresholds are the returned numbers."""
     if not samples:
         return "no_samples"
+    if any(item.get("receive_response_headers_ms") is None for item in samples):
+        return "unknown"
     if any(item.get("http_attempts", 0) > 1 for item in samples):
         return "retries_inside_call"
     connect = [
@@ -86,50 +115,100 @@ def classify(samples: list[dict]) -> str:
     return "mixed"
 
 
-class TracingClient:
-    """httpx.Client subclass created per process, not per request."""
-
-    def __new__(cls, **kwargs):
+def transport_category(http_client, base_url: str) -> str:
+    """direct, http_proxy, socks, or unknown. No proxy address is read."""
+    try:
         import httpx
 
-        class _Client(httpx.Client):
-            def send(self, request, **send_kwargs):
-                events: list[tuple[str, float]] = []
-
-                def trace(name, info):
-                    del info
-                    events.append((name, time.perf_counter()))
-
-                request.extensions["trace"] = trace
-                try:
-                    return super().send(request, **send_kwargs)
-                finally:
-                    self.last_trace = summarize_events(events)
-
-        kwargs.setdefault("trust_env", True)
-        kwargs.setdefault("timeout", 60.0)
-        return _Client(**kwargs)
+        url = httpx.URL(base_url)
+        transport = http_client._transport_for_url(url)
+        pool = getattr(transport, "_pool", None)
+        if pool is None:
+            return "unknown"
+        name = type(pool).__name__.lower()
+        if "socks" in name:
+            return "socks"
+        if "proxy" in name:
+            return "http_proxy"
+        if name == "connectionpool":
+            return "direct"
+        return "unknown"
+    except Exception:
+        return "unknown"
 
 
-def _close(client) -> None:
-    closer = getattr(client, "close", None)
+def proxy_env_source() -> str:
+    present = [name for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy") if os.environ.get(name)]
+    if any(name.lower().startswith("https_") for name in present):
+        return "env_https"
+    if any(name.lower().startswith("all_") for name in present):
+        return "env_all"
+    if present:
+        return "env_http"
+    return "none"
+
+
+def hostname_of(base_url: str) -> str | None:
+    return urllib.parse.urlsplit(base_url).hostname
+
+
+def llm_timeout_from_block(block: dict):
+    """Same branches as core.providers.llm.openai.LLMProvider."""
+    import httpx
+
+    timeout_config = block.get("timeout")
+    if isinstance(timeout_config, dict):
+        return httpx.Timeout(
+            pool=timeout_config.get("pool", 2.0),
+            connect=timeout_config.get("connect", 3.0),
+            write=timeout_config.get("write", 5.0),
+            read=timeout_config.get("read", 60.0),
+        )
+    if isinstance(timeout_config, (int, float)) and timeout_config > 0:
+        return httpx.Timeout(timeout_config)
+    return httpx.Timeout(300)
+
+
+def make_embed_sdk():
+    import openai
+
+    sdk = openai.OpenAI()
+    return sdk, attach_trace(sdk._client)
+
+
+def make_llm_sdk(api_key: str, base_url: str, timeout):
+    import openai
+
+    sdk = openai.OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+    return sdk, attach_trace(sdk._client)
+
+
+def _close(sdk) -> None:
+    closer = getattr(sdk, "close", None)
     if closer:
         closer()
 
 
-def embed_samples(model: str, dimensions: int | None, repeats: int) -> dict:
-    import httpx
-    import openai
+def _sample_after(log: TraceLog, started: float, status, error: str | None, extra: dict) -> dict:
+    sample = log.summarize()
+    sample.update(extra)
+    sample["status"] = status
+    sample["error"] = error
+    sample["call_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    return sample
 
+
+def embed_samples(model: str, dimensions: int | None, repeats: int) -> dict:
     base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or ""
-    http_client = TracingClient()
-    sdk = openai.OpenAI(http_client=http_client, timeout=httpx.Timeout(60.0))
-    texts = [f"diag embed {index}" for index in range(1, repeats + 1)]
+    sdk, log = make_embed_sdk()
     samples = []
+    category = "unknown"
     try:
-        for text in texts:
+        category = transport_category(sdk._client, str(sdk.base_url))
+        for index in range(1, repeats + 1):
+            log.clear()
             started = time.perf_counter()
-            kwargs = {"input": [text], "model": model}
+            kwargs = {"input": [f"diag embed {index}"], "model": model}
             if dimensions:
                 kwargs["dimensions"] = dimensions
             try:
@@ -141,43 +220,37 @@ def embed_samples(model: str, dimensions: int | None, repeats: int) -> dict:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 vector_len = None
                 error = type(exc).__name__
-            sample = dict(getattr(http_client, "last_trace", {}))
-            sample.update(
-                {
-                    "status": status,
-                    "vector_len": vector_len,
-                    "error": error,
-                    "call_ms": round((time.perf_counter() - started) * 1000.0, 1),
-                }
-            )
-            samples.append(sample)
+            samples.append(_sample_after(log, started, status, error, {"vector_len": vector_len}))
     finally:
         _close(sdk)
-        _close(http_client)
     return {
         "kind": "embed",
-        "hostname": hostname_of(base_url),
+        "hostname": hostname_of(str(sdk.base_url)),
+        "base_url_source": "env" if base_url else "sdk_default",
         "model": model,
         "dimensions": dimensions,
+        "max_retries": sdk.max_retries,
+        "transport": category,
+        "proxy_env_source": proxy_env_source(),
         "samples": samples,
         "classification": classify(samples),
     }
 
 
-def llm_samples(api_key: str, base_url: str, model: str, repeats: int) -> dict:
-    import httpx
-    import openai
-
-    http_client = TracingClient()
-    sdk = openai.OpenAI(api_key=api_key, base_url=base_url, http_client=http_client, timeout=httpx.Timeout(60.0))
+def llm_samples(api_key: str, base_url: str, model: str, timeout, repeats: int) -> dict:
+    sdk, log = make_llm_sdk(api_key, base_url, timeout)
     extra = {"enable_thinking": False} if "aliyuncs.com" in (hostname_of(base_url) or "") else None
     samples = []
+    category = "unknown"
     try:
+        category = transport_category(sdk._client, str(sdk.base_url))
         for _ in range(repeats):
+            log.clear()
             started = time.perf_counter()
             first_text_ms = None
             error = None
             status = None
+            stream = None
             try:
                 kwargs = {
                     "model": model,
@@ -195,51 +268,48 @@ def llm_samples(api_key: str, base_url: str, model: str, repeats: int) -> dict:
                     if text:
                         first_text_ms = round((time.perf_counter() - started) * 1000.0, 1)
                         break
-                stream.close()
             except Exception as exc:
                 error = type(exc).__name__
                 status = getattr(getattr(exc, "response", None), "status_code", None)
-            sample = dict(getattr(http_client, "last_trace", {}))
-            sample.update(
-                {
-                    "status": status,
-                    "error": error,
-                    "first_text_ms": first_text_ms,
-                    "call_ms": round((time.perf_counter() - started) * 1000.0, 1),
-                }
+            finally:
+                if stream is not None:
+                    stream.close()
+            samples.append(
+                _sample_after(log, started, status, error, {"first_text_ms": first_text_ms})
             )
-            samples.append(sample)
     finally:
         _close(sdk)
-        _close(http_client)
     return {
         "kind": "llm",
-        "hostname": hostname_of(base_url),
+        "hostname": hostname_of(str(sdk.base_url)),
         "model": model,
+        "max_retries": sdk.max_retries,
+        "transport": category,
+        "proxy_env_source": proxy_env_source(),
         "samples": samples,
         "classification": classify(samples),
     }
 
 
-def llm_settings_from_config(path: Path) -> tuple[str, str, str]:
+def llm_settings_from_config(path: Path) -> tuple[str, str, str, object]:
     import yaml
 
     loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
     selected = loaded["selected_module"]["LLM"]
     block = loaded["LLM"][selected]
     base_url = block.get("base_url") or block.get("url")
-    return block["api_key"], base_url, block["model_name"]
+    return block["api_key"], base_url, block["model_name"], llm_timeout_from_block(block)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Trace the existing SDK connection path")
+    parser = argparse.ArgumentParser(description="Trace the production OpenAI client")
     parser.add_argument("--mode", choices=("embed", "llm"), required=True)
     parser.add_argument("--model", default="")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--dimensions", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=0)
     args = parser.parse_args()
-    report = {"credentials_printed": False, "proxy": proxy_report()}
+    report = {"credentials_printed": False}
     if args.mode == "embed":
         model = args.model or os.environ.get("MEM0_DEFAULT_EMBEDDER_MODEL") or ""
         if not model:
@@ -251,18 +321,18 @@ def main() -> int:
         report.update(embed_samples(model, dims, args.repeats or 3))
     else:
         if args.config:
-            api_key, base_url, model = llm_settings_from_config(args.config)
+            api_key, base_url, model, timeout = llm_settings_from_config(args.config)
         else:
-            api_key = os.environ.get("OPENAI_API_KEY") or ""
-            base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or ""
-            model = args.model
+            report["error"] = "llm_settings_absent"
+            json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+            return 2
         if not api_key or not base_url or not model:
             report["error"] = "llm_settings_absent"
             json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
             sys.stdout.write("\n")
             return 2
-        os.environ["OPENAI_API_KEY"] = api_key
-        report.update(llm_samples(api_key, base_url, model, args.repeats or 2))
+        report.update(llm_samples(api_key, base_url, model, timeout, args.repeats or 2))
     json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0
