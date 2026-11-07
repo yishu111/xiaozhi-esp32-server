@@ -76,15 +76,20 @@ class TTSProvider(TTSProviderBase):
             raise Exception(error_msg)  # 抛出异常，让调用方捕获
 
     def _mark_first_tts_audio(self, audio_chunk: bytes) -> None:
-        """Provider audio byte. Not the first packet written to the device socket."""
+        """Provider audio byte for the synth that is running now.
+
+        Uses the sentence id captured when synthesis started. A later utterance
+        must not inherit this chunk, and this is not a socket send.
+        """
         conn = getattr(self, "conn", None)
-        if conn is None or not audio_chunk:
+        sentence_id = getattr(self, "_synth_sentence_id", None)
+        if conn is None or not audio_chunk or not sentence_id:
             return
         from core.utils.utterance_timing import mark_sentence
 
         mark_sentence(
             conn,
-            getattr(self, "current_sentence_id", None),
+            sentence_id,
             "tts_first_audio",
             bytes=len(audio_chunk),
         )

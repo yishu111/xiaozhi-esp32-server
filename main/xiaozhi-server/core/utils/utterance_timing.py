@@ -31,6 +31,17 @@ _ENUMS = {
     "memory": {"ok", "empty", "timeout", "skipped", "error", "cancelled"},
 }
 
+# These stages belong to one synthesis generation. They must not fall back
+# onto whatever utterance happens to be current when a callback arrives.
+BOUND_STAGES = frozenset(
+    {
+        "llm_first_sentence",
+        "tts_request",
+        "tts_first_audio",
+        "server_audio_sent",
+    }
+)
+
 _SUMMARY_GAPS = (
     ("eos_to_asr_ms", "end_of_speech", "asr_final"),
     ("asr_to_memory_ms", "asr_final", "memory_lookup_start"),
@@ -54,6 +65,7 @@ class UtteranceTiming:
         self.aborted = False
         self.finished = False
         self.server_sent = False
+        self.order_ok = True
         self._lock = threading.Lock()
 
     def mark(self, stage: str, **meta: Any) -> bool:
@@ -84,22 +96,29 @@ class UtteranceTiming:
         with self._lock:
             if earlier not in self.marks or later not in self.marks:
                 return None
-            return int(round((self.marks[later][0] - self.marks[earlier][0]) * 1000))
+            delta = int(round((self.marks[later][0] - self.marks[earlier][0]) * 1000))
+            if delta < 0:
+                self.order_ok = False
+                return None
+            return delta
 
     def format_stage(self, stage: str) -> str:
         with self._lock:
             stamp, meta = self.marks[stage]
             previous = [item[0] for name, item in self.marks.items() if name != stage]
         t_ms = int(round((stamp - self.t0) * 1000))
-        since_prev = int(round((stamp - max(previous)) * 1000)) if previous else t_ms
+        if previous:
+            since_prev = int(round((stamp - max(previous)) * 1000))
+        else:
+            since_prev = t_ms
         if since_prev < 0:
-            since_prev = 0
+            self.order_ok = False
         parts = [
             "utterance",
             f"id={self.id}",
             f"stage={stage}",
             f"t_ms={t_ms}",
-            f"since_prev_ms={since_prev}",
+            f"since_prev_ms={'na' if since_prev < 0 else since_prev}",
         ]
         for key in sorted(meta):
             parts.append(f"{key}={meta[key]}")
@@ -112,8 +131,20 @@ class UtteranceTiming:
             parts.append(f"{name}={'na' if delta is None else delta}")
         parts.append(f"aborted={int(self.aborted)}")
         parts.append(f"server_sent={int(self.server_sent)}")
+        parts.append(f"order_ok={int(self.order_ok)}")
         parts.append("hardware_playback=unmeasured")
         return " ".join(parts)
+
+
+def _drop(conn, stage: str, reason: str) -> None:
+    line = f"utterance drop stage={stage} reason={reason}"
+    bucket = getattr(conn, "_timing_lines", None)
+    if isinstance(bucket, list):
+        bucket.append(line)
+    try:
+        _logger_for(conn).bind(tag=TAG).info(line)
+    except Exception:
+        return
 
 
 def _logger_for(conn):
@@ -187,23 +218,41 @@ def bind_sentence(conn, sentence_id: Optional[str]) -> Optional[UtteranceTiming]
     return utt
 
 
-def timing_for_sentence(conn, sentence_id: Optional[str] = None) -> Optional[UtteranceTiming]:
+def timing_for_sentence(conn, sentence_id: Optional[str] = None, *, fallback: bool = True) -> Optional[UtteranceTiming]:
     table = getattr(conn, "_timings_by_sentence", None)
     if sentence_id and isinstance(table, dict) and sentence_id in table:
         return table[sentence_id]
+    if not fallback:
+        return None
     return _current(conn)
 
 
 def mark_sentence(conn, sentence_id: Optional[str], stage: str, **meta: Any) -> None:
     if conn is None:
         return
-    utt = timing_for_sentence(conn, sentence_id)
-    if utt is None:
-        utt = UtteranceTiming()
-        conn._utterance_timing = utt
-        if sentence_id:
-            bind_sentence(conn, sentence_id)
-            utt = timing_for_sentence(conn, sentence_id) or utt
+    bound = stage in BOUND_STAGES
+    if bound:
+        if not sentence_id:
+            _drop(conn, stage, "unbound")
+            return
+        if getattr(conn, "client_abort", False) or getattr(conn, "sentence_id", None) != sentence_id:
+            _drop(conn, stage, "stale")
+            return
+        utt = timing_for_sentence(conn, sentence_id, fallback=False)
+        if utt is None:
+            _drop(conn, stage, "unbound")
+            return
+        if stage == "tts_first_audio" and "tts_request" not in utt.marks:
+            _drop(conn, stage, "before_request")
+            return
+    else:
+        utt = timing_for_sentence(conn, sentence_id, fallback=True)
+        if utt is None:
+            utt = UtteranceTiming()
+            conn._utterance_timing = utt
+            if sentence_id:
+                bind_sentence(conn, sentence_id)
+                utt = timing_for_sentence(conn, sentence_id, fallback=False) or utt
     if not utt.mark(stage, **meta):
         return
     _emit(conn, utt, utt.format_stage(stage))

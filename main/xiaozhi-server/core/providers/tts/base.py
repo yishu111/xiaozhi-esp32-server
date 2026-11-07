@@ -118,7 +118,10 @@ class TTSProviderBase(ABC):
 
     def handle_opus(self, opus_data: bytes):
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
-        self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, getattr(self, 'current_sentence_id', None)))
+        sentence_id = getattr(self, "_synth_sentence_id", None)
+        if sentence_id is None:
+            sentence_id = getattr(self, "current_sentence_id", None)
+        self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, sentence_id))
 
     def handle_audio_file(self, file_audio: bytes, text):
         self.before_stop_play_files.append((file_audio, text))
@@ -129,6 +132,7 @@ class TTSProviderBase(ABC):
         text = MarkdownCleaner.clean_markdown(text)
         conn = getattr(self, "conn", None)
         sentence_id = getattr(self, "current_sentence_id", None)
+        self._synth_sentence_id = sentence_id
         if conn is not None:
             mark_sentence(conn, sentence_id, "tts_request", chars=len(text or ""))
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
@@ -145,7 +149,7 @@ class TTSProviderBase(ABC):
                             # 提供者整段音频已齐。流式首包若已记过 tts_first_audio，这里不会覆盖。
                             mark_sentence(conn, sentence_id, "tts_first_audio", bytes=len(audio_bytes))
                         # 使用原始文本用于显示/上报
-                        self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
+                        self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, sentence_id))
                         audio_bytes_to_data_stream(
                             audio_bytes,
                             file_type=self.audio_file_type,
@@ -170,6 +174,7 @@ class TTSProviderBase(ABC):
                 logger.bind(tag=TAG).error(
                     f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                 )
+            self._synth_sentence_id = None
             return None
         else:
             tmp_file = self.generate_filename()
@@ -194,11 +199,13 @@ class TTSProviderBase(ABC):
                     logger.bind(tag=TAG).error(
                         f"语音生成失败: {original_text}，请检查网络或服务是否正常"
                     )
-                self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
+                self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, sentence_id))
                 self._process_audio_file_stream(tmp_file, callback=opus_handler)
             except Exception as e:
                 logger.bind(tag=TAG).error(f"Failed to generate TTS file: {e}")
                 return None
+            finally:
+                self._synth_sentence_id = None
     
     def to_tts(self, text):
         # 保留原始文本用于日志/显示
