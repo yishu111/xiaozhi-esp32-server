@@ -10,6 +10,8 @@ from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
+from core.utils.memory_gate import cancel_memory_lookup, schedule_memory_lookup
+from core.utils.utterance_timing import finish_timing, note_asr_final
 
 TAG = __name__
 
@@ -87,11 +89,16 @@ async def startToChat(conn: "ConnectionHandler", text):
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
         await handleAbortMessage(conn)
 
+    note_asr_final(conn, len(actual_text or ""))
+    # 记忆查询和后面的意图/字幕发送重叠，模型请求仍要等查询结束。
+    schedule_memory_lookup(conn, actual_text)
+
     # 首先进行意图分析，使用实际文本内容
     intent_handled = await handle_user_intent(conn, actual_text)
 
     if intent_handled:
         # 如果意图已被处理，不再进行聊天
+        cancel_memory_lookup(conn)
         return
 
     # 意图未被处理，继续常规聊天流程，使用实际文本内容

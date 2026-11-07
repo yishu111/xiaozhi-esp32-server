@@ -168,6 +168,11 @@ class ASRProviderBase(ABC):
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
+            else:
+                from core.utils.utterance_timing import finish_timing, note_asr_final
+
+                note_asr_final(conn, 0)
+                finish_timing(conn, complete=False)
         except Exception as e:
             logger.bind(tag=TAG).error(f"处理语音停止失败: {e}")
             import traceback

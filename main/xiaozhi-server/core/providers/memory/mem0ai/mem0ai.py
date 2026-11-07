@@ -3,8 +3,7 @@ import asyncio
 import traceback
 
 from ..base import MemoryProviderBase, logger
-from mem0 import MemoryClient
-from core.utils.util import check_model_key
+from ..record_scope import deletion_allowed, extract_records, scoped_records
 
 TAG = __name__
 
@@ -14,6 +13,8 @@ class MemoryProvider(MemoryProviderBase):
         super().__init__(config)
         self.api_key = config.get("api_key", "")
         self.api_version = config.get("api_version", "v1.1")
+        from core.utils.util import check_model_key
+
         model_key_msg = check_model_key("Mem0ai", self.api_key)
         if model_key_msg:
             logger.bind(tag=TAG).error(model_key_msg)
@@ -23,6 +24,8 @@ class MemoryProvider(MemoryProviderBase):
             self.use_mem0 = True
 
         try:
+            from mem0 import MemoryClient
+
             self.client = MemoryClient(api_key=self.api_key)
             logger.bind(tag=TAG).info("成功连接到 Mem0ai 服务")
         except Exception as e:
@@ -119,3 +122,57 @@ class MemoryProvider(MemoryProviderBase):
         except Exception as e:
             logger.bind(tag=TAG).error(f"查询记忆失败: {str(e)}")
             return ""
+
+    async def list_own_memories(self, query: str = "") -> dict:
+        if not getattr(self, "use_mem0", False) or not getattr(self, "role_id", None):
+            return {"supported": False, "records": []}
+        client = getattr(self, "client", None)
+        if client is None or not hasattr(client, "search"):
+            return {"supported": False, "records": []}
+
+        def _call():
+            filters = {"user_id": self.role_id}
+            if query:
+                return client.search(query, filters=filters)
+            if hasattr(client, "get_all"):
+                return client.get_all(filters=filters)
+            return client.search(query, filters=filters)
+
+        try:
+            payload = await asyncio.to_thread(_call)
+        except Exception:
+            logger.bind(tag=TAG).error("列出记忆失败")
+            return {"supported": True, "records": [], "error": "lookup_failed"}
+        return {"supported": True, "records": scoped_records(payload, self.role_id)}
+
+    async def delete_own_memories(self, memory_ids) -> dict:
+        ids = [str(item) for item in (memory_ids or [])]
+        if not getattr(self, "use_mem0", False) or not getattr(self, "role_id", None):
+            return {"supported": False, "deleted": [], "refused": ids}
+        client = getattr(self, "client", None)
+        if client is None or not hasattr(client, "get") or not hasattr(client, "delete"):
+            return {"supported": False, "deleted": [], "refused": ids}
+
+        deleted = []
+        refused = []
+        for memory_id in ids:
+            try:
+                payload = await asyncio.to_thread(client.get, memory_id)
+            except Exception:
+                refused.append(memory_id)
+                continue
+            records = extract_records(payload)
+            record = records[0] if records else None
+            if not deletion_allowed(record, self.role_id):
+                refused.append(memory_id)
+                continue
+            try:
+                await asyncio.to_thread(client.delete, memory_id)
+            except Exception:
+                refused.append(memory_id)
+                continue
+            deleted.append(memory_id)
+        logger.bind(tag=TAG).info(
+            f"删除记忆 deleted={len(deleted)} refused={len(refused)}"
+        )
+        return {"supported": True, "deleted": deleted, "refused": refused}

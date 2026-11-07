@@ -20,6 +20,8 @@ from core.utils.output_counter import add_device_output
 from core.handle.reportHandle import enqueue_tts_report
 from core.handle.sendAudioHandle import sendAudioMessage
 from core.utils.util import audio_bytes_to_data_stream, audio_to_data_stream
+from core.utils.tts_segment import cut_first_segment
+from core.utils.utterance_timing import mark_sentence
 from core.providers.tts.dto.dto import (
     TTSMessageDTO,
     SentenceType,
@@ -118,6 +120,14 @@ class TTSProviderBase(ABC):
 
     def handle_opus(self, opus_data: bytes):
         logger.bind(tag=TAG).debug(f"推送数据到队列里面帧数～～ {len(opus_data)}")
+        conn = getattr(self, "conn", None)
+        if conn is not None and opus_data:
+            mark_sentence(
+                conn,
+                getattr(self, "current_sentence_id", None),
+                "tts_first_audio",
+                bytes=len(opus_data),
+            )
         self.tts_audio_queue.put((SentenceType.MIDDLE, opus_data, None, getattr(self, 'current_sentence_id', None)))
 
     def handle_audio_file(self, file_audio: bytes, text):
@@ -127,6 +137,10 @@ class TTSProviderBase(ABC):
         # 保留原始文本用于显示/上报
         original_text = text
         text = MarkdownCleaner.clean_markdown(text)
+        conn = getattr(self, "conn", None)
+        sentence_id = getattr(self, "current_sentence_id", None)
+        if conn is not None:
+            mark_sentence(conn, sentence_id, "tts_request", chars=len(text or ""))
         # 使用正则一次性替换，避免重复遍历和部分匹配问题
         if self._correct_words_pattern:
             text = self._correct_words_pattern.sub(lambda m: self.correct_words[m.group(0)], text)
@@ -137,6 +151,14 @@ class TTSProviderBase(ABC):
                 try:
                     audio_bytes = asyncio.run(self.text_to_speak(text, None))
                     if audio_bytes:
+                        # 流式 TTS 可能已经在首包记过 tts_first_audio，这里重复标记会被忽略。
+                        if conn is not None:
+                            mark_sentence(
+                                conn,
+                                sentence_id,
+                                "tts_first_audio",
+                                bytes=len(audio_bytes),
+                            )
                         # 使用原始文本用于显示/上报
                         self.tts_audio_queue.put((SentenceType.FIRST, None, original_text, getattr(self, 'current_sentence_id', None)))
                         audio_bytes_to_data_stream(
@@ -483,28 +505,30 @@ class TTSProviderBase(ABC):
         if hasattr(self, "ws") and self.ws:
             await self.ws.close()
 
+    def _first_segment_max_chars(self) -> int:
+        conn = getattr(self, "conn", None)
+        config = getattr(conn, "config", None) if conn is not None else None
+        if not isinstance(config, dict):
+            return 0
+        try:
+            return int(config.get("tts_first_segment_max_chars", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def _get_segment_text(self):
         # 合并当前全部文本并处理未分割部分
         full_text = "".join(self.tts_text_buff)
         current_text = full_text[self.processed_chars :]  # 从未处理的位置开始
-        last_punct_pos = -1
-
-        # 根据是否是第一句话选择不同的标点符号集合
-        punctuations_to_use = (
-            self.first_sentence_punctuations
-            if self.is_first_sentence
-            else self.punctuations
+        segment_text_raw, _kind = cut_first_segment(
+            current_text,
+            is_first=self.is_first_sentence,
+            punctuations=self.punctuations,
+            first_punctuations=self.first_sentence_punctuations,
+            max_chars=self._first_segment_max_chars() if self.is_first_sentence else 0,
         )
 
-        for punct in punctuations_to_use:
-            pos = current_text.rfind(punct)
-            if (pos != -1 and last_punct_pos == -1) or (
-                pos != -1 and pos < last_punct_pos
-            ):
-                last_punct_pos = pos
-
-        if last_punct_pos != -1:
-            segment_text_raw = current_text[: last_punct_pos + 1]
+        if segment_text_raw:
+            was_first = self.is_first_sentence
             segment_text = textUtils.get_string_no_punctuation_or_emoji(
                 segment_text_raw
             )
@@ -513,6 +537,13 @@ class TTSProviderBase(ABC):
             # 如果是第一句话，在找到第一个逗号后，将标志设置为False
             if self.is_first_sentence:
                 self.is_first_sentence = False
+            if was_first and getattr(self, "conn", None) is not None:
+                mark_sentence(
+                    self.conn,
+                    getattr(self, "current_sentence_id", None),
+                    "llm_first_sentence",
+                    chars=len(segment_text_raw),
+                )
 
             return segment_text
         elif self.tts_stop_request and current_text:
