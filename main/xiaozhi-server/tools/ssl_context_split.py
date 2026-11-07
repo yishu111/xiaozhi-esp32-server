@@ -272,6 +272,9 @@ def library_facts() -> dict:
         facts["edge_init_create_default_context"] = _calls(init_source, "create_default_context")
         facts["edge_inner_stream_create_default_context"] = _calls(inner_source, "create_default_context")
         facts["edge_inner_stream_uses_certifi"] = "certifi.where()" in inner_source
+        module = inspect.getsource(inspect.getmodule(edge_tts.Communicate))
+        facts["edge_module_create_default_context"] = _calls(module, "create_default_context")
+        facts["edge_module_reuses_ssl_ctx"] = "_SSL_CTX" in module
     except Exception as exc:
         facts["edge_tts_error"] = type(exc).__name__
     return facts

@@ -4,8 +4,9 @@
 The file must already hash to the upstream blob. This tool does not import
 mem0, does not open Postgres, and does not edit server/main.py. A search is
 timed only when every present user_id, agent_id, and run_id equals
-diag-synthetic-not-a-user. Other searches do not log and return the same
-object as before. Restart the memory process after install or uninstall.
+diag-synthetic-not-a-user. The numbers are returned on that response as
+synthetic_phase_ms and also emitted with logging.warning. Other searches
+do not log and do not gain that key. Restart after install or uninstall.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import sys
 from pathlib import Path
 
 EXPECTED_SHA256 = "f329ca4a17af1fbefb32ac10d4cc7ae7ddbdb7435a87eb74c30915cff98b8b7c"
-PATCHED_SHA256 = "a0b12bc773c8b7b8a3eb56aec00bc5d6a58d938f074ee0da30273e52bb07e854"
+PATCHED_SHA256 = "dbde7297bb9a9d44967bfda27482abba4f5f779c38a69350b68a3e38e0ca309d"
 SYNTHETIC_ENTITY = "diag-synthetic-not-a-user"
 BACKUP_SUFFIX = ".mem0-synthetic-phase.bak"
 
@@ -117,25 +118,67 @@ _RETURN_OLD = """            original_memories.append(memory_item_dict)
 
 _RETURN_NEW = """            original_memories.append(memory_item_dict)
 
+        _mem0_phase_report = None
         if _mem0_phase:
             _mem0_done = time.perf_counter()
-            logger.info(
-                "mem0_synthetic_phase preprocess_ms=%.1f embed_ms=%.1f vector_ms=%.1f keyword_ms=%.1f entity_ms=%.1f rank_ms=%.1f total_ms=%.1f entity_ran=%d semantic_n=%d keyword_n=%d returned_n=%d",
-                (_mem0_pre - _mem0_origin) * 1000.0,
-                (_mem0_embed - _mem0_pre) * 1000.0,
-                (_mem0_vector - _mem0_embed) * 1000.0,
-                (_mem0_keyword - _mem0_vector) * 1000.0,
-                (_mem0_entity - _mem0_keyword) * 1000.0,
-                (_mem0_done - _mem0_entity) * 1000.0,
-                (_mem0_done - _mem0_origin) * 1000.0,
-                1 if query_entities else 0,
-                len(semantic_results) if semantic_results is not None else -1,
-                len(keyword_results) if keyword_results is not None else -1,
-                len(original_memories),
-            )
-        return original_memories
+            _mem0_phase_report = {
+                "preprocess_ms": round((_mem0_pre - _mem0_origin) * 1000.0, 1),
+                "embed_ms": round((_mem0_embed - _mem0_pre) * 1000.0, 1),
+                "vector_ms": round((_mem0_vector - _mem0_embed) * 1000.0, 1),
+                "keyword_ms": round((_mem0_keyword - _mem0_vector) * 1000.0, 1),
+                "entity_ms": round((_mem0_entity - _mem0_keyword) * 1000.0, 1),
+                "rank_ms": round((_mem0_done - _mem0_entity) * 1000.0, 1),
+                "total_ms": round((_mem0_done - _mem0_origin) * 1000.0, 1),
+                "entity_ran": 1 if query_entities else 0,
+                "semantic_n": len(semantic_results) if semantic_results is not None else -1,
+                "keyword_n": len(keyword_results) if keyword_results is not None else -1,
+                "returned_n": len(original_memories),
+            }
+            try:
+                logging.warning(
+                    "mem0_synthetic_phase preprocess_ms=%.1f embed_ms=%.1f vector_ms=%.1f keyword_ms=%.1f entity_ms=%.1f rank_ms=%.1f total_ms=%.1f entity_ran=%d semantic_n=%d keyword_n=%d returned_n=%d",
+                    _mem0_phase_report["preprocess_ms"],
+                    _mem0_phase_report["embed_ms"],
+                    _mem0_phase_report["vector_ms"],
+                    _mem0_phase_report["keyword_ms"],
+                    _mem0_phase_report["entity_ms"],
+                    _mem0_phase_report["rank_ms"],
+                    _mem0_phase_report["total_ms"],
+                    _mem0_phase_report["entity_ran"],
+                    _mem0_phase_report["semantic_n"],
+                    _mem0_phase_report["keyword_n"],
+                    _mem0_phase_report["returned_n"],
+                )
+            except Exception:
+                pass
+        return original_memories, _mem0_phase_report
 
     def _compute_entity_boosts(self, query_entities, filters):
+"""
+
+_CALL_OLD = """        search_start = time.perf_counter()
+        original_memories = self._search_vector_store(
+            query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
+        )
+        search_elapsed_seconds = time.perf_counter() - search_start
+"""
+
+_CALL_NEW = """        search_start = time.perf_counter()
+        original_memories, _mem0_phase_report = self._search_vector_store(
+            query, effective_filters, limit, threshold, explain=explain, show_expired=show_expired
+        )
+        search_elapsed_seconds = time.perf_counter() - search_start
+"""
+
+_RESPONSE_OLD = """            display_first_run_notice(self, "sync", "search")
+        return {"results": original_memories}
+"""
+
+_RESPONSE_NEW = """            display_first_run_notice(self, "sync", "search")
+        response = {"results": original_memories}
+        if _mem0_phase_report:
+            response["synthetic_phase_ms"] = _mem0_phase_report
+        return response
 """
 
 _REPLACEMENTS = (
@@ -143,6 +186,8 @@ _REPLACEMENTS = (
     (_STEPS_OLD, _STEPS_NEW),
     (_ENTITY_OLD, _ENTITY_NEW),
     (_RETURN_OLD, _RETURN_NEW),
+    (_CALL_OLD, _CALL_NEW),
+    (_RESPONSE_OLD, _RESPONSE_NEW),
 )
 
 
