@@ -8,6 +8,10 @@ from urllib.parse import urlparse
 
 TAG = __name__
 logger = setup_logging()
+# httpx.Limits leaves idle connections at 5s unless keepalive_expiry is set.
+# OpenAI 2.8.1 and 3.33.0 both pass max_connections=1000 and
+# max_keepalive_connections=100 without changing that 5s default.
+KEEPALIVE_EXPIRY_S = 120.0
 
 # 需要禁用思考模式的平台域名及其对应参数（默认关闭思考模式）
 THINKING_DISABLED_DOMAINS = {
@@ -17,6 +21,19 @@ THINKING_DISABLED_DOMAINS = {
     "moonshot.cn": {"thinking": {"type": "disabled"}},
     "volces.com": {"thinking": {"type": "disabled"}},
 }
+
+
+def _openai_http_client(timeout, base_url):
+    """SDK wrapper and limits, with a longer idle expiry. TLS verification stays on."""
+    from openai import DefaultHttpxClient
+    from openai._constants import DEFAULT_CONNECTION_LIMITS
+
+    limits = httpx.Limits(
+        max_connections=DEFAULT_CONNECTION_LIMITS.max_connections,
+        max_keepalive_connections=DEFAULT_CONNECTION_LIMITS.max_keepalive_connections,
+        keepalive_expiry=KEEPALIVE_EXPIRY_S,
+    )
+    return DefaultHttpxClient(timeout=timeout, limits=limits, base_url=base_url)
 
 
 class LLMProvider(LLMProviderBase):
@@ -69,7 +86,12 @@ class LLMProvider(LLMProviderBase):
         model_key_msg = check_model_key("LLM", self.api_key)
         if model_key_msg:
             logger.bind(tag=TAG).error(model_key_msg)
-        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=custom_timeout)
+        self.client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=custom_timeout,
+            http_client=_openai_http_client(custom_timeout, self.base_url),
+        )
 
     @staticmethod
     def normalize_dialogue(dialogue):

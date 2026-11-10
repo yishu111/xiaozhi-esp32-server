@@ -61,14 +61,35 @@ class TTSProvider(TTSProviderBase):
                 with open(output_file, "ab") as f:  # 改为追加模式避免覆盖
                     async for chunk in communicate.stream():
                         if chunk["type"] == "audio":  # 只处理音频数据块
+                            self._mark_first_tts_audio(chunk["data"])
                             f.write(chunk["data"])
             else:
                 # 返回音频二进制数据
                 audio_bytes = b""
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
+                        self._mark_first_tts_audio(chunk["data"])
                         audio_bytes += chunk["data"]
                 return audio_bytes
         except Exception as e:
             error_msg = f"Edge TTS请求失败: {e}"
             raise Exception(error_msg)  # 抛出异常，让调用方捕获
+
+    def _mark_first_tts_audio(self, audio_chunk: bytes) -> None:
+        """Provider audio byte for the synth that is running now.
+
+        Uses the sentence id captured when synthesis started. A later utterance
+        must not inherit this chunk, and this is not a socket send.
+        """
+        conn = getattr(self, "conn", None)
+        sentence_id = getattr(self, "_synth_sentence_id", None)
+        if conn is None or not audio_chunk or not sentence_id:
+            return
+        from core.utils.utterance_timing import mark_sentence
+
+        mark_sentence(
+            conn,
+            sentence_id,
+            "tts_first_audio",
+            bytes=len(audio_chunk),
+        )

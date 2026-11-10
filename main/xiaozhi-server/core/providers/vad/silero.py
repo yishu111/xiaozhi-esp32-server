@@ -107,6 +107,9 @@ class VADProvider(VADProviderBase):
                     stop_duration = time.time() * 1000 - conn.vad_last_voice_time
                     if stop_duration >= self.silence_threshold_ms:
                         conn.client_voice_stop = True
+                        from core.utils.utterance_timing import begin_end_of_speech
+
+                        begin_end_of_speech(conn, "vad")
                 if client_have_voice:
                     conn.client_have_voice = True
                     conn.vad_last_voice_time = time.time() * 1000

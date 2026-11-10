@@ -41,6 +41,9 @@ class ListenTextMessageHandler(TextMessageHandler):
                 return
 
             conn.client_voice_stop = True
+            from core.utils.utterance_timing import begin_end_of_speech
+
+            begin_end_of_speech(conn, "manual")
             if conn.asr.interface_type == InterfaceType.STREAM:
                 # 流式模式下，发送结束请求
                 asyncio.create_task(conn.asr._send_stop_request())

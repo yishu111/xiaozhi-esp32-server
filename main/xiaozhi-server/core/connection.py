@@ -45,6 +45,13 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.llm_stream import consume_until_abort
+from core.utils.memory_gate import (
+    MEMORY_TIMEOUT_SPOKEN,
+    resolve_memory_blocking,
+    should_call_llm,
+)
+from core.utils.utterance_timing import bind_sentence, mark_current
 
 
 TAG = __name__
@@ -1057,12 +1064,13 @@ class ConnectionHandler:
         current_sentence_id = None
 
         if query is not None:
-            self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
+            self.logger.bind(tag=TAG).info("大模型收到用户消息")
 
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            bind_sentence(self, current_sentence_id)
             self.dialogue.put(Message(role="user", content=query))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1109,14 +1117,16 @@ class ConnectionHandler:
         response_message = []
 
         try:
-            # 使用带记忆的对话
+            # 使用带记忆的对话。查询在 startToChat 里已经开始，这里只等待同一次结果。
             memory_str = None
-            # 仅当query非空（代表用户询问）时查询记忆
             if self.memory is not None and query:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.memory.query_memory(query), self.loop
-                )
-                memory_str = future.result()
+                decision = resolve_memory_blocking(self, query)
+                if not should_call_llm(decision.status):
+                    self._speak_without_llm(current_sentence_id, decision.status)
+                    return None
+                memory_str = decision.text
+
+            mark_current(self, "llm_request")
 
             # 仅在该说话人首次出现时把身份注入 system，之后靠对话历史首轮保留，
             # 避免每轮在 system 重复出现名字诱导模型反复称呼
@@ -1143,7 +1153,9 @@ class ConnectionHandler:
                     ),
                 )
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
+            self.logger.bind(tag=TAG).error(f"LLM 处理出错: {type(e).__name__}")
+            if depth == 0:
+                self._speak_without_llm(current_sentence_id, "error")
             return None
 
         # 处理流式响应
@@ -1153,9 +1165,7 @@ class ConnectionHandler:
         content_arguments = ""
         emotion_flag = True
         try:
-            for response in llm_responses:
-                if self.client_abort:
-                    break
+            for response in consume_until_abort(llm_responses, lambda: self.client_abort):
                 if self.intent_type == "function_call" and functions is not None:
                     content, tools_call = response
                     if "content" in response:
@@ -1187,6 +1197,7 @@ class ConnectionHandler:
                                     new_part = self._clean_response_garbage(new_part)
                                     if new_part:
                                         tc["_da_sent"] = safe_end
+                                        mark_current(self, "llm_first_token", chars=len(new_part))
                                         self.tts.tts_text_queue.put(
                                             TTSMessageDTO(
                                                 sentence_id=current_sentence_id,
@@ -1208,6 +1219,7 @@ class ConnectionHandler:
                     emotion_flag = False
 
                 if content is not None and len(content) > 0:
+                    mark_current(self, "llm_first_token", chars=len(content))
                     if not tool_call_flag:
                         response_message.append(content)
                         self.tts.tts_text_queue.put(
@@ -1219,7 +1231,7 @@ class ConnectionHandler:
                             )
                         )
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
+            self.logger.bind(tag=TAG).error(f"LLM stream processing error: {type(e).__name__}")
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1285,6 +1297,7 @@ class ConnectionHandler:
                             if remaining:
                                 remaining = self._clean_response_garbage(remaining)
                                 if remaining:
+                                    mark_current(self, "llm_first_token", chars=len(remaining))
                                     self.tts.tts_text_queue.put(
                                         TTSMessageDTO(
                                             sentence_id=current_sentence_id,
@@ -1326,14 +1339,25 @@ class ConnectionHandler:
 
                 # 收集所有工具调用的 Future
                 futures_with_data = []
+                redacted_tools = {"forget_memory", "submit_grok_task"}
                 for tool_call_data in tool_calls_list:
-                    self.logger.bind(tag=TAG).debug(
-                        f"function_name={tool_call_data['name']}, function_id={tool_call_data['id']}, function_arguments={tool_call_data['arguments']}"
-                    )
+                    if tool_call_data["name"] in redacted_tools:
+                        self.logger.bind(tag=TAG).debug(
+                            f"function_name={tool_call_data['name']}, function_id={tool_call_data['id']}, arguments_redacted=1"
+                        )
+                    else:
+                        self.logger.bind(tag=TAG).debug(
+                            f"function_name={tool_call_data['name']}, function_id={tool_call_data['id']}, function_arguments={tool_call_data['arguments']}"
+                        )
 
                     # 使用公共方法上报工具调用
                     tool_input = json.loads(tool_call_data.get("arguments") or "{}")
-                    enqueue_tool_report(self, tool_call_data['name'], tool_input)
+                    reported_input = (
+                        {"redacted": True}
+                        if tool_call_data["name"] in redacted_tools
+                        else tool_input
+                    )
+                    enqueue_tool_report(self, tool_call_data['name'], reported_input)
 
                     future = asyncio.run_coroutine_threadsafe(
                         self.func_handler.handle_llm_function_call(
@@ -1353,7 +1377,13 @@ class ConnectionHandler:
                         result = future.result(timeout=tool_call_timeout)
                         tool_results.append((result, tool_call_data))
                         # 使用公共方法上报工具调用结果
-                        enqueue_tool_report(self, tool_call_data['name'], tool_input, str(result.result) if result.result else None, report_tool_call=False)
+                        if tool_call_data["name"] in redacted_tools:
+                            reported_input = {"redacted": True}
+                            reported_result = "redacted"
+                        else:
+                            reported_input = tool_input
+                            reported_result = str(result.result) if result.result else None
+                        enqueue_tool_report(self, tool_call_data['name'], reported_input, reported_result, report_tool_call=False)
 
                     except Exception as e:
                         self.logger.bind(tag=TAG).error(
@@ -1385,6 +1415,10 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
+            if self.client_abort:
+                utt = getattr(self, "_utterance_timing", None)
+                if utt is not None:
+                    utt.aborted = True
             # 使用lambda延迟计算，只有在DEBUG级别时才执行get_llm_dialogue()
             self.logger.bind(tag=TAG).debug(
                 lambda: json.dumps(
@@ -1393,6 +1427,30 @@ class ConnectionHandler:
             )
 
         return True
+
+    def _speak_without_llm(self, sentence_id, status):
+        """Finish the turn without calling the LLM. Timeout must not look like empty memory."""
+        if status == "timeout":
+            text = MEMORY_TIMEOUT_SPOKEN
+        else:
+            text = get_system_error_response(self.config)
+        if not sentence_id or self.tts is None:
+            return
+        self.tts.tts_text_queue.put(
+            TTSMessageDTO(
+                sentence_id=sentence_id,
+                sentence_type=SentenceType.MIDDLE,
+                content_type=ContentType.TEXT,
+                content_detail=text,
+            )
+        )
+        self.tts.tts_text_queue.put(
+            TTSMessageDTO(
+                sentence_id=sentence_id,
+                sentence_type=SentenceType.LAST,
+                content_type=ContentType.ACTION,
+            )
+        )
 
     def _handle_function_result(self, tool_results, depth, streamed_text=""):
         need_llm_tools = []

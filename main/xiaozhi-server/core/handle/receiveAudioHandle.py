@@ -1,5 +1,4 @@
 import time
-import json
 import asyncio
 from typing import TYPE_CHECKING
 
@@ -10,6 +9,8 @@ from core.handle.abortHandle import handleAbortMessage
 from core.handle.intentHandler import handle_user_intent
 from core.utils.output_counter import check_device_output_limit
 from core.handle.sendAudioHandle import send_stt_message, SentenceType
+from core.utils.asr_text import parse_chat_text
+from core.utils.utterance_timing import note_asr_final
 
 TAG = __name__
 
@@ -42,28 +43,9 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
 
 async def startToChat(conn: "ConnectionHandler", text):
     # 检查输入是否是JSON格式（包含说话人信息）
-    speaker_name = None
-    actual_text = text
-
-    try:
-        # 尝试解析JSON格式的输入
-        if text.strip().startswith("{") and text.strip().endswith("}"):
-            data = json.loads(text)
-            if "speaker" in data and "content" in data:
-                speaker_name = data["speaker"]
-                actual_content = data["content"]
-                conn.logger.bind(tag=TAG).info(f"解析到说话人信息: {speaker_name}")
-
-                # 仅在该说话人首次出现时保留 {"speaker":...} JSON，让模型自然称呼一次；
-                # 后续轮降为纯文本，避免每轮重复出现名字诱导模型反复称呼
-                if speaker_name not in conn.introduced_speakers:
-                    conn.introduced_speakers.add(speaker_name)
-                    actual_text = text
-                else:
-                    actual_text = actual_content
-    except (json.JSONDecodeError, KeyError):
-        # 如果解析失败，继续使用原始文本
-        pass
+    speaker_name, actual_text = parse_chat_text(text, conn.introduced_speakers)
+    if speaker_name:
+        conn.logger.bind(tag=TAG).info(f"解析到说话人信息: {speaker_name}")
 
     # 保存说话人信息到连接对象
     if speaker_name:
@@ -86,6 +68,9 @@ async def startToChat(conn: "ConnectionHandler", text):
     # manual 模式下不打断正在播放的内容
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
         await handleAbortMessage(conn)
+
+    note_asr_final(conn, len(actual_text or ""))
+    # 记忆查询留在 chat() 里再发起。这里不创建任务，避免同步实现堵住事件循环。
 
     # 首先进行意图分析，使用实际文本内容
     intent_handled = await handle_user_intent(conn, actual_text)
